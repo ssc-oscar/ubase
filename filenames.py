@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 
-import csv
-
 import argparse
+import logging
 
 from oscar import *
 
@@ -37,11 +36,17 @@ if __name__ == "__main__":
                         help='Output filename, "-" or skip for stdout')
     args = parser.parse_args()
     extensions = args.extensions
-    writer = csv.writer(args.output)
+    counter = 0
 
-    for file_obj in File.all():  # 2.6B file paths
-        fname = str(file_obj).rstrip("\n")
+    for file_obj in File.all():  # 2.6B file paths total; 32M *.py paths
+
+        logging.warning("Processing file #%d: %s", counter, fname)
+        counter += 1
+
+        fname = str(file_obj)
+        # TODO: perhaps, usuer fnmatch?
         if file_extension(fname) not in extensions:
             continue
 
-        writer.writerow([fname])
+        args.output.write(fname)
+        args.output.write("\n")
