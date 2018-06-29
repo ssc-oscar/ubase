@@ -270,11 +270,20 @@ if __name__ == "__main__":
             # mark commit as processed
             processed_commits[commit.bin_sha] = imports is None
 
-            if imports is None:
-                # starting from project head - commit
-                imports = commit_imports(commit, {}, args.pattern)
+            if imports is None:  # starting from project head commit
+                try:  # handle missing Tree objects
+                    # in this case, it is more appropriate to ignore this commit
+                    # than to consider it empty, because it will be recorded
+                    # as removal of all dependencies
+                    imports = commit_imports(commit, {}, args.pattern)
+                except ObjectNotFound:
+                    continue
                 cum_imports = set().union(*imports.values())
-            parent_imports = commit_imports(parent, imports, args.pattern)
+
+            try:  # similar to the imports above
+                parent_imports = commit_imports(parent, imports, args.pattern)
+            except ObjectNotFound:
+                continue
 
             date = commit.authored_at.strftime("%Y-%m")
 
