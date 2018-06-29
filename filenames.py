@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 
 import argparse
+from fnmatch import fnmatch
 import logging
 
 from oscar import *
 
 
-DEFAULT_EXTENSIONS = ('py',)
+DEFAULT_PATTERN = '*.py'
 
 
 def file_extension(fname):
@@ -29,24 +30,22 @@ def file_extension(fname):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Get all filenames with the specified extension(s)")
-    parser.add_argument('extensions', default=DEFAULT_EXTENSIONS, nargs="*",
+    parser.add_argument('pattern', default=DEFAULT_PATTERN, nargs="?",
                         help='File extensions to use')
     parser.add_argument('-o', '--output', default="-",
                         type=argparse.FileType('w'),
                         help='Output filename, "-" or skip for stdout')
     args = parser.parse_args()
-    extensions = args.extensions
     counter = 0
 
     for file_obj in File.all():  # 2.6B file paths total; 32M *.py paths
+        path = str(file_obj)
 
-        logging.warning("Processing file #%d: %s", counter, fname)
+        logging.warning("Processing file #%d: %s", counter, path)
         counter += 1
 
-        fname = str(file_obj)
-        # TODO: perhaps, usuer fnmatch?
-        if file_extension(fname) not in extensions:
+        if fnmatch(path, args.pattern):
             continue
 
-        args.output.write(fname)
+        args.output.write(path)
         args.output.write("\n")

@@ -8,22 +8,9 @@ from fnmatch import fnmatch
 import logging
 import re
 
-from filenames import *
+from filenames import DEFAULT_PATTERN
 from oscar import *
 
-"""
-Package name can have:
-    lower and capital case letters, digits, underscores
-    - it cannot start with a digit (underscore is fine)
-    - there are multilevel imports (i.e. dots)
-Package name cannot contain:
-    hyphen, or start with a digit
-
-PEP8: "Modules SHOULD have short, all-lowercase names"  // NOT MUST
-https://www.python.org/dev/peps/pep-0008/#package-and-module-names
-"""
-
-DEFAULT_PATTERN = '*.py'
 
 # libraries.io only looks for `from ...`:
 # https://github.com/librariesio/pydeps/blob/master/pydeps.rb
@@ -91,12 +78,15 @@ BUILTINS = {
 
 def top_namespace(namespace):
     """ Get the top level namespace
-    Similar to filename, it's the part of the namespace before the first dot.
+
+    For relative imports, an empty string is returned.
 
     >>> top_namespace('matplotlib.pyplot')
     'matplotlib'
     >>> top_namespace('pandas')
     'pandas'
+    >>> top_namespace('.utils')
+    ''
     """
     return namespace.split('.', 1)[0]
 
@@ -113,7 +103,7 @@ def blob_imports(blob_sha, max_size=4096):
 
     How it works:
         look for lines `import X [as Y]` and `from X import Y`
-        return the part of X before the first dot
+        return list of X-es
 
     Package name can have:
         lower and capital case letters, digits, underscores
@@ -128,44 +118,35 @@ def blob_imports(blob_sha, max_size=4096):
     :param max_size: max number of data bytes to consider
     :return: generator of dependencies as strings
 
-    >>> ",".join(blob_imports("import csv"))
-    'csv'
-    >>> ",".join(blob_imports("import csv as tsv"))
-    'csv'
-    >>> ",".join(blob_imports("import CsV, cSv, csv"))
-    'CsV,cSv,csv'
-    >>> ",".join(blob_imports("\timport csv"))
-    'csv'
-    >>> ",".join(blob_imports("\t#import csv"))
-    ''
-    >>> ",".join(blob_imports("#\timport csv"))
-    ''
-    >>> ",".join(blob_imports("import csv\\n    import json"))
-    'csv,json'
-    >>> ",".join(blob_imports("import csv, json"))
-    'csv,json'
-    >>> ",".join(blob_imports("import csv, json  # pandas"))
-    'csv,json'
-    >>> ",".join(blob_imports("import libarchive.public as libarchive"))
-    'libarchive.public'
-    >>> ",".join(blob_imports("from ghd_common import utils"))
-    'ghd_common'
-    >>> ",".join(blob_imports("from ghd.common import utils as common"))
-    'ghd.common'
+    # https://github.com/django/django/tree/42eb0c09
+    >>> files = Commit('42eb0c09bcf062b9336d1f1a728813e4a599ad47').tree.files
+    >>> blob_imports(files['scripts/manage_translations.py'])
+    ['os', 'argparse', 'subprocess', 'django.core.management']
+
+    # https://github.com/tornadoweb/tornado/tree/5e7e0577
+    >>> files = Commit('5e7e05773913221bc168f4dd3a24bcee22d63bef').tree.files
+    >>> blob_imports(files['setup.py'])  # doctest: +NORMALIZE_WHITESPACE
+    ['os', 'platform', 'sys', 'warnings', 'setuptools', 'setuptools',
+     'distutils.core', 'distutils.core', 'distutils.command.build_ext']
+
     """
     # 2m without doing anything
     # 3m with data read only
     # 4m with multiline re
     # 20m per 166 projects for the full cycle split+match by line
-    try:
-        data = Blob(blob_sha).data
-    except ObjectNotFound:
-        return
 
-    return IMPORT_PATTERN.findall(data[:max_size])
+    return IMPORT_PATTERN.findall(Blob(blob_sha).data[:max_size])
 
 
 def importable_paths(path):
+    """ Get a list of modules that could be imported locally
+
+    Python 3 doesn't require __init__.py files to consider folder a module,
+    so any folders with Python files are also included.
+
+    >>> importable_paths('my_module/utils.py')
+    ['my_module', 'utils']
+    """
     chunks = [chunk
               for chunk in path.split("/")
               if chunk and (chunk[0].isalpha() or chunk[0] == "_")]
@@ -174,9 +155,25 @@ def importable_paths(path):
     return chunks
 
 
-def commit_imports(commit, blob_imports_cache = None,
-                   pattern=DEFAULT_PATTERN):
-    cache = blob_imports_cache or {}
+def commit_imports(commit, imports_cache=None, pattern=DEFAULT_PATTERN):
+    # type: (Commit, dict, str) -> dict
+    """ Get commit imports
+
+    How it works:
+        - collect all blob imports
+        - take only top namespaces (i.e. django out of django.foo.bar)
+        - removes local imports (i.e. my_module if my_module.py is present)
+        - removes builtins (like csv, multiprocessing etc)
+
+    Args:
+        commit (oscar.Commit): a commit to analyze
+        imports_cache (dict): a dictionary of blob_sha: set(top namespaces)
+        pattern (str): filename pattern to consider, *.py by default
+
+    Returns:
+        dict: blob_sha: set of top namespaces
+    """
+    cache = imports_cache or {}
     if commit is None:
         return {}
     # paths: file path: blob sha
@@ -187,8 +184,7 @@ def commit_imports(commit, blob_imports_cache = None,
 
     # blob imports: blob sha: set(top namespaces)
     imports = {blob_sha: cache.get(blob_sha,
-        {top_namespace(ns)
-         for ns in blob_imports(blob_sha)}
+        {top_namespace(ns) for ns in blob_imports(blob_sha)}
                     - filenames - BUILTINS)
           for blob_sha in paths.values()}
 
@@ -196,7 +192,14 @@ def commit_imports(commit, blob_imports_cache = None,
 
 
 def commits_fp_monthly(commits):
-    """ Filter out Project.commits_fp to only leave latest commit in a month """
+    """ Filter out Project.commits_fp to only leave latest commit in a month
+
+    This method is concieved as performance optimization - since we aggregate
+    usage by month, it makes sense to only view last commit in a month.
+
+    Commits with invalid dates (dead CMOS battery, invalid data etc) have None
+    as authored date and will be ignored.
+    """
     month = None
     for commit in commits:
         if (commit.authored_at and month != commit.authored_at.strftime("%Y-%m")
@@ -235,7 +238,7 @@ if __name__ == "__main__":
         lambda: defaultdict(int))  # [namespace][month] = increment
     counter = 0
 
-    for project_name in projects:  # ~800M projects in total, ?? contain .py
+    for project_name in projects:  # ~800M projects in total, ?? use Python
         project_name = project_name.rstrip("\r\n")
         if project_name == 'EMPTY':  # special value
             continue
