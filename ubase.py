@@ -6,6 +6,7 @@ import argparse
 from collections import defaultdict
 from fnmatch import fnmatch
 import logging
+import os
 import re
 
 from filenames import DEFAULT_PATTERN
@@ -21,9 +22,10 @@ IMPORT_PATTERN = re.compile(
     re.M)
 
 
-# Combined from
+# Obtained using ghd.pypi.get_builtins() from
 # https://docs.python.org/2/library/index.html
 # https://docs.python.org/3/library/index.html
+
 BUILTINS = {
     '', 'AL', 'BaseHTTPServer', 'Bastion', 'CGIHTTPServer', 'ColorPicker',
     'ConfigParser', 'Cookie', 'DEVICE', 'DocXMLRPCServer', 'EasyDialogs', 'FL',
@@ -219,12 +221,22 @@ if __name__ == "__main__":
     parser.add_argument('-o', '--output', default="-",
                         type=argparse.FileType('w'),
                         help='Output filename, "-" or skip for stdout')
+    parser.add_argument('-S', '--snapshots-dir', type=str, nargs="?",
+                        help='Directory path to for intermediate snapshots')
+    parser.add_argument('-s', '--snapshots-interval', default=10000, type=int,
+                        help='Snapshots interval, every processed N files')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help="Log progress to stderr")
     args = parser.parse_args()
+
+    if args.snapshots_dir and not os.path.isdir(args.snapshots_dir):
+        parser.exit(1, "Snapshot dir does not exist")
+
+    logging.basicConfig(format='%(asctime)s %(message)s',
+                        level=logging.INFO if args.verbose else logging.WARNING)
+
     projects = args.input
-
     # projects = ['user2589_minicms'] #, 'YeonjuGo_cmssw']
-
-    logging.basicConfig(format='%(asctime)s %(message)s')
 
     # 57 bytes of RAM to store 20-char bin_sha
     # bool: 24 bytes
@@ -236,9 +248,32 @@ if __name__ == "__main__":
     missing_parents = 0
     stats = defaultdict(
         lambda: defaultdict(int))  # [namespace][month] = increment
+    # terminal commit stats, [month] = number
+    commit_stats = {
+        'total': defaultdict(int),
+        'terminal': defaultdict(int)
+    }
     counter = 0
 
-    for project_name in projects:  # ~800M projects in total, ?? use Python
+    def snapshot():
+        if not args.snapshots_dir:
+            return
+        # saving usage
+        pd.DataFrame(stats).T.fillna(0).astype(int).to_csv(
+            os.path.join(args.snapshots_dir, "usage_snapshot_%d.csv" % counter))
+
+        # saving commit stats
+        pd.DataFrame(commit_stats).T.fillna(0).astype(int).to_csv(
+            os.path.join(args.snapshots_dir, "commit_stats_%d.csv" % counter))
+
+        # save number of missing parents
+        fh = open("missing_parents_%d.csv" % counter, "w")
+        fh.write(str(missing_parents))
+        fh.close()
+        # saving processed_commits would take few GB per snapshot, nah
+
+    # ~800M projects in total, ~1M (projected) use Python
+    for counter, project_name in enumerate(projects):
         project_name = project_name.rstrip("\r\n")
         if project_name == 'EMPTY':  # special value
             continue
@@ -249,18 +284,29 @@ if __name__ == "__main__":
         commits = tuple(commits_fp_monthly(commits))
         reduced_length = len(commits)
 
-        logging.warning("#%d: %s (%d/%d commits)", counter, project_name,
-                        full_length, reduced_length)
-        counter += 1
+        logging.info("#%d: %s (%d/%d commits)", counter, project_name,
+                     full_length, reduced_length)
 
         imports = None
         cum_imports = set()
         for commit in commits:
+            commit_month = commit.authored_at.strftime("%Y-%m")
+
             if commit.bin_sha in processed_commits:
+                # we have seen this commit before. if we got here from a
+                # continuation line, unmark it as terminal; otherwise, ignore
                 if imports is not None:
+                    if processed_commits[commit.bin_sha]:
+                        # i.e. if this commit was marked as terminal before
+                        commit_stats['terminal'][commit_month] -= 1
                     processed_commits[commit.bin_sha] = False
                 break
+
+            # this is a new commit
             logging.debug("Processing %s", commit.sha)
+            commit_stats['total'][commit_month] += 1
+            commit_stats['terminal'][commit_month] += imports is None
+
             try:
                 parent = commit.parents.next()
             except StopIteration:
@@ -304,6 +350,10 @@ if __name__ == "__main__":
             imports = parent_imports
             cum_imports = cum_parent_imports
 
-    df = pd.DataFrame(stats).T
-    df.fillna(0).astype(int).to_csv(args.output)
+        if counter and not counter % args.snapshots_interval:
+            snapshot()
+
+    snapshot()
+
+    pd.DataFrame(stats).T.fillna(0).astype(int).to_csv(args.output)
     logging.warning("Missing parents: %d", missing_parents)

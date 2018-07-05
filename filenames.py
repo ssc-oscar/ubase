@@ -35,13 +35,18 @@ if __name__ == "__main__":
     parser.add_argument('-o', '--output', default="-",
                         type=argparse.FileType('w'),
                         help='Output filename, "-" or skip for stdout')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help="Log progress to stderr")
     args = parser.parse_args()
     counter = 0
+
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO)
 
     for file_obj in File.all():  # 2.6B file paths total; 32M *.py paths
         path = str(file_obj)
 
-        logging.warning("Processing file #%d: %s", counter, path)
+        logging.info("Processing file #%d: %s", counter, path)
         counter += 1
 
         if fnmatch(path, args.pattern):
