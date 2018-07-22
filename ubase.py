@@ -4,6 +4,7 @@ import pandas as pd
 
 import argparse
 from collections import defaultdict
+import csv
 from fnmatch import fnmatch
 import logging
 import os
@@ -122,22 +123,47 @@ def blob_imports(blob_sha, max_size=4096):
 
     # https://github.com/django/django/tree/42eb0c09
     >>> files = Commit('42eb0c09bcf062b9336d1f1a728813e4a599ad47').tree.files
-    >>> blob_imports(files['scripts/manage_translations.py'])
+    >>> list(blob_imports(files['scripts/manage_translations.py']))
     ['os', 'argparse', 'subprocess', 'django.core.management']
 
     # https://github.com/tornadoweb/tornado/tree/5e7e0577
     >>> files = Commit('5e7e05773913221bc168f4dd3a24bcee22d63bef').tree.files
-    >>> blob_imports(files['setup.py'])  # doctest: +NORMALIZE_WHITESPACE
+    >>> list(blob_imports(files['setup.py']))  # doctest: +NORMALIZE_WHITESPACE
     ['os', 'platform', 'sys', 'warnings', 'setuptools', 'setuptools',
      'distutils.core', 'distutils.core', 'distutils.command.build_ext']
 
+    # https://github.com/block-cat/zm_bom/blob/master/__init__.py
+    >>> files = Commit('28993f161ac3b0c22968664ca0e617d3ce9c2d70').tree.files
+    >>> list(blob_imports(files['__init__.py']))
+    ['zm_bom', 'zm_bom_line']
+
+    KNOWN BUG, too expensive to fix: line continuations are not handled.
+    E.g.:
+    from bla.blah.blah \
+        import foo
+    'foo' will be counted as a separate import.
+
+    Live example:
+        Project cms-sw_cmssw,
+        Commit  902d319c4ffa26721a783f0efe6197f08752c9d8,
+        File    RecoTauTag/Configuration/python/RecoPFTauTag_cff.py
+        Blob    9310647d843b322e83236bb94edc113398201c08
+    The effect of this bug is negligible comparing to how it will
+    increase parsing time
     """
     # 2m without doing anything
     # 3m with data read only
     # 4m with multiline re
+    # ?? multiline re + split on commas
     # 20m per 166 projects for the full cycle split+match by line
 
-    return IMPORT_PATTERN.findall(Blob(blob_sha).data[:max_size])
+    import_statements = IMPORT_PATTERN.findall(Blob(blob_sha).data[:max_size])
+    # now, split multiple imports, e.g. import os, sys
+    for import_statement in import_statements:
+        for namespace in import_statement.split(","):
+            # empty imports (syntax error that happen sometimes)
+            # will be filtered out by BUILTINS
+            yield namespace.strip()
 
 
 def importable_paths(path):
@@ -176,7 +202,7 @@ def commit_imports(commit, imports_cache=None, pattern=DEFAULT_PATTERN):
         dict: blob_sha: set of top namespaces
     """
     cache = imports_cache or {}
-    if commit is None:
+    if not commit:
         return {}
     # paths: file path: blob sha
     paths = {path: blob_sha for path, blob_sha in commit.tree.files.items()
@@ -221,6 +247,8 @@ if __name__ == "__main__":
     parser.add_argument('-o', '--output', default="-",
                         type=argparse.FileType('w'),
                         help='Output filename, "-" or skip for stdout')
+    parser.add_argument('-d', '--date-format', default="%Y-%m", type=str,
+                        help='Date format, %Y-%m by default')
     parser.add_argument('-S', '--snapshots-dir', type=str, nargs="?",
                         help='Directory path to for intermediate snapshots')
     parser.add_argument('-s', '--snapshots-interval', default=10000, type=int,
@@ -229,6 +257,10 @@ if __name__ == "__main__":
                         help="Log progress to stderr")
     args = parser.parse_args()
 
+    output_fields = ('project', 'date', 'added', 'removed', 'commit', 'parent')
+    writer = csv.DictWriter(args.output, output_fields)
+    writer.writeheader()
+
     if args.snapshots_dir and not os.path.isdir(args.snapshots_dir):
         parser.exit(1, "Snapshot dir does not exist")
 
@@ -236,7 +268,7 @@ if __name__ == "__main__":
                         level=logging.INFO if args.verbose else logging.WARNING)
 
     projects = args.input
-    # projects = ['user2589_minicms'] #, 'YeonjuGo_cmssw']
+    # projects = ['user2589_minicms', 'YeonjuGo_cmssw']
 
     # 57 bytes of RAM to store 20-char bin_sha
     # bool: 24 bytes
@@ -245,7 +277,6 @@ if __name__ == "__main__":
     # worst case: 1B commits = 129Gb RAM
     # 700+ GB available, so it should work
     processed_commits = {}  # bin_sha: bool(terminal)
-    missing_parents = 0
     stats = defaultdict(
         lambda: defaultdict(int))  # [namespace][month] = increment
     # terminal commit stats, [month] = number
@@ -265,11 +296,6 @@ if __name__ == "__main__":
         # saving commit stats
         pd.DataFrame(commit_stats).T.fillna(0).astype(int).to_csv(
             os.path.join(args.snapshots_dir, "commit_stats_%d.csv" % counter))
-
-        # save number of missing parents
-        fh = open("missing_parents_%d.csv" % counter, "w")
-        fh.write(str(missing_parents))
-        fh.close()
         # saving processed_commits would take few GB per snapshot, nah
 
     # ~800M projects in total, ~1M (projected) use Python
@@ -289,33 +315,30 @@ if __name__ == "__main__":
 
         imports = None
         cum_imports = set()
-        for commit in commits:
-            commit_month = commit.authored_at.strftime("%Y-%m")
+        for i, commit in enumerate(commits):
+            date = commit.authored_at.strftime(args.date_format)
 
             if commit.bin_sha in processed_commits:
-                # we have seen this commit before. if we got here from a
-                # continuation line, unmark it as terminal; otherwise, ignore
+                # we have seen this commit before.
+                # if we got here from a continuation line, unmark it as terminal
                 if imports is not None:
                     if processed_commits[commit.bin_sha]:
                         # i.e. if this commit was marked as terminal before
-                        commit_stats['terminal'][commit_month] -= 1
+                        commit_stats['terminal'][date] -= 1
                     processed_commits[commit.bin_sha] = False
+                # otherwise, stop processing this project - we've seen
+                # all commits up to this point
                 break
 
             # this is a new commit
             logging.debug("Processing %s", commit.sha)
-            commit_stats['total'][commit_month] += 1
-            commit_stats['terminal'][commit_month] += imports is None
+            commit_stats['total'][date] += 1
+            commit_stats['terminal'][date] += imports is None
 
-            try:
-                parent = commit.parents.next()
-            except StopIteration:
+            if i + 1 < len(commits):
+                parent = commits[i + 1]
+            else:
                 parent = None
-            except ObjectNotFound:
-                # one of rare cases we don't have parent commit data
-                # Assumption: nothing changed
-                missing_parents += 1
-                continue
             # mark commit as processed
             processed_commits[commit.bin_sha] = imports is None
 
@@ -328,13 +351,12 @@ if __name__ == "__main__":
                 except ObjectNotFound:
                     continue
                 cum_imports = set().union(*imports.values())
+            # else we've got imports from the prev iteration already
 
             try:  # similar to the imports above
                 parent_imports = commit_imports(parent, imports, args.pattern)
             except ObjectNotFound:
                 continue
-
-            date = commit.authored_at.strftime("%Y-%m")
 
             cum_parent_imports = set().union(*parent_imports.values())
 
@@ -346,7 +368,17 @@ if __name__ == "__main__":
             for dep in added:
                 stats[dep][date] += 1
 
-            commit = parent
+            if added or deleted:
+                writer.writerow({
+                    'project': project_name,
+                    'added': ",".join(added),
+                    'removed': ",".join(deleted),
+                    'date': date,
+                    'commit': commit.sha,
+                    'parent': parent and parent.sha
+                })
+                args.output.flush()
+
             imports = parent_imports
             cum_imports = cum_parent_imports
 
@@ -354,6 +386,3 @@ if __name__ == "__main__":
             snapshot()
 
     snapshot()
-
-    pd.DataFrame(stats).T.fillna(0).astype(int).to_csv(args.output)
-    logging.warning("Missing parents: %d", missing_parents)
